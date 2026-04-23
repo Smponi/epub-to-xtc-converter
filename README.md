@@ -4,6 +4,13 @@ A tool for converting EPUB files to XTC/XTCH format and optimizing EPUBs for e-i
 
 **[Live Demo](https://liashkov.site/epub-to-xtc-converter/)**
 
+## Documentation
+
+- [Project Architecture](docs/architecture.md)
+- [Security & Spec Review](docs/security-review.md)
+- [XTC Format Specification](docs/xtc-format-spec.md)
+- [Building CREngine WASM](docs/building-crengine-wasm.md)
+
 ## Features
 
 ### EPUB to XTC/XTCH Converter
@@ -174,6 +181,8 @@ cd web && php -S localhost:8000
 
 Then open http://localhost:8000 in your browser.
 
+The Docker image serves the site with an unprivileged Nginx runtime and ships restrictive response headers for common browser hardening.
+
 ## Project Structure
 
 ```
@@ -227,6 +236,10 @@ Requires a modern browser with:
 - Canvas API
 
 Tested on: Chrome 90+, Firefox 88+, Safari 14+, Edge 90+
+
+## Spec Status
+
+The XTC/XTH/XTG/XTCH documentation in this repository is reverse-engineered and should be treated as implementation guidance, not a formally published vendor standard. See [docs/security-review.md](docs/security-review.md) for current conformance notes and known gaps.
 
 ## GitHub Pages Deployment
 
