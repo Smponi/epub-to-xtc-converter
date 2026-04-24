@@ -7,9 +7,10 @@ let totalPages = 0;
 let currentToc = [];
 let loadedFiles = [];
 let currentFileIndex = 0;
-let ditherWorker = null;
-let ditherCallbacks = new Map();
-let ditherJobId = 0;
+let exportWorkers = [];
+let exportCallbacks = new Map();
+let exportJobId = 0;
+let exportWorkerCursor = 0;
 
 // Device presets
 const DEVICES = {
@@ -96,8 +97,8 @@ async function init() {
         // Load default fonts
         await loadDefaultFonts();
 
-        // Initialize dither worker
-        initDitherWorker();
+        // Initialize export worker pool
+        initExportWorkers();
 
         // Show initial message in chapter list
         showNoChaptersMessage();
@@ -198,20 +199,49 @@ async function loadGoogleFont(familyName) {
     return success;
 }
 
-function initDitherWorker() {
+function getExportWorkerCount() {
+    var parallelism = navigator.hardwareConcurrency || 2;
+    if (parallelism <= 2) return 1;
+    return Math.min(4, parallelism - 1);
+}
+
+function initExportWorkers() {
+    var workerCount = getExportWorkerCount();
+
     try {
-        ditherWorker = new Worker('dither-worker.js');
-        ditherWorker.onmessage = function(e) {
-            const data = e.data;
-            const callback = ditherCallbacks.get(data.id);
-            if (callback) {
-                ditherCallbacks.delete(data.id);
-                callback(data.imageData);
-            }
-        };
-        console.log('Dither worker initialized');
+        for (var i = 0; i < workerCount; i++) {
+            var worker = new Worker('export-worker.js');
+            worker.onmessage = function(e) {
+                var data = e.data;
+                var callback = exportCallbacks.get(data.id);
+                if (!callback) return;
+
+                exportCallbacks.delete(data.id);
+                if (data.error) {
+                    callback.reject(new Error(data.error));
+                    return;
+                }
+
+                callback.resolve({
+                    pageNum: data.pageNum,
+                    pageData: new Uint8Array(data.pageData)
+                });
+            };
+            worker.onerror = function(err) {
+                for (var pair of exportCallbacks.values()) {
+                    pair.reject(err);
+                }
+                exportCallbacks.clear();
+                exportWorkers = [];
+                console.warn('Export worker failed, using main-thread fallback', err);
+            };
+            exportWorkers.push(worker);
+        }
+
+        console.log('Export worker pool initialized:', exportWorkers.length);
     } catch (err) {
-        console.warn('Dither worker not available, using sync fallback');
+        exportWorkers = [];
+        console.warn('Export workers not available, using sync fallback');
     }
 }
 
@@ -1128,23 +1158,92 @@ async function exportAllFiles() {
 
 async function generateXTC(progressCallback) {
     var isHQ = qualityMode.value === 'hq';
-    var pages = [];
+    var metadata = getExportMetadata();
+    var toc = currentToc.slice();
+    var pages = new Array(totalPages);
+    var completedPages = new Map();
+    var nextPageToStore = 0;
+    var scheduledPages = 0;
+    var waiter = null;
+    var processingError = null;
+    var maxInFlight = Math.max(2, exportWorkers.length > 0 ? exportWorkers.length * 2 : 2);
 
-    // Render all pages
-    for (var i = 0; i < totalPages; i++) {
-        var pageData = await renderPageForExport(i);
-        pages.push(pageData);
-
-        if (progressCallback) {
-            progressCallback((i + 1) / totalPages * 100, i + 1);
+    function notifyWaiter() {
+        if (waiter) {
+            var resolve = waiter;
+            waiter = null;
+            resolve();
         }
     }
 
-    // Build XTC container
-    return buildXTCContainer(pages, isHQ);
+    function waitForCompletion() {
+        if (processingError) {
+            return Promise.reject(processingError);
+        }
+        return new Promise(function(resolve) {
+            waiter = resolve;
+        });
+    }
+
+    async function flushReady(waitForNext) {
+        while (!completedPages.has(nextPageToStore)) {
+            if (!waitForNext) {
+                return;
+            }
+            await waitForCompletion();
+            if (processingError) {
+                throw processingError;
+            }
+        }
+
+        while (completedPages.has(nextPageToStore)) {
+            pages[nextPageToStore] = completedPages.get(nextPageToStore);
+            completedPages.delete(nextPageToStore);
+
+            if (progressCallback) {
+                progressCallback((nextPageToStore + 1) / totalPages * 100, nextPageToStore + 1);
+            }
+
+            nextPageToStore++;
+        }
+    }
+
+    for (var i = 0; i < totalPages; i++) {
+        var imageData = renderPageImageForExport(i);
+        scheduledPages++;
+
+        processRenderedPageForExport(imageData, i, isHQ)
+            .then(function(result) {
+                completedPages.set(result.pageNum, result.pageData);
+                notifyWaiter();
+            })
+            .catch(function(err) {
+                processingError = err;
+                notifyWaiter();
+            });
+
+        if (scheduledPages - nextPageToStore >= maxInFlight) {
+            await flushReady(true);
+        } else {
+            await flushReady(false);
+        }
+    }
+
+    while (nextPageToStore < totalPages) {
+        await flushReady(true);
+    }
+
+    return buildXTCContainerBlob(pages, isHQ, metadata, toc);
 }
 
 async function renderPageForExport(pageNum) {
+    var imageData = renderPageImageForExport(pageNum);
+    var isHQ = qualityMode.value === 'hq';
+    var result = await processRenderedPageForExport(imageData, pageNum, isHQ);
+    return result.pageData;
+}
+
+function renderPageImageForExport(pageNum) {
     renderer.goToPage(pageNum);
     renderer.renderCurrentPage();
 
@@ -1159,58 +1258,82 @@ async function renderPageForExport(pageNum) {
         SCREEN_HEIGHT
     );
 
-    // Apply dithering if enabled
-    if (enableDithering.checked) {
-        var bits = qualityMode.value === 'hq' ? 2 : 1;
-        var strength = parseInt(ditherStrength.value) / 100;
-        imageData = await applyDithering(imageData, bits, strength);
-    }
-
-    // Apply negative if enabled
-    if (enableNegative.checked) {
-        applyNegative(imageData);
-    }
-
     // Draw progress bar if enabled
     if (enableProgressBar.checked) {
         drawProgressBar(imageData, pageNum);
     }
 
-    // Encode to XTG/XTH
-    var isHQ = qualityMode.value === 'hq';
+    return imageData;
+}
+
+function getExportMetadata() {
+    var info = renderer.getDocumentInfo();
+    return {
+        title: info.title || loadedFiles[currentFileIndex].name,
+        author: info.author || ''
+    };
+}
+
+async function processRenderedPageForExport(imageData, pageNum, isHQ) {
+    var options = {
+        enableDithering: enableDithering.checked,
+        ditherStrength: parseInt(ditherStrength.value) / 100,
+        enableNegative: enableNegative.checked
+    };
+
+    if (exportWorkers.length > 0) {
+        return await processRenderedPageAsync(imageData, pageNum, isHQ, options);
+    }
+
+    return {
+        pageNum: pageNum,
+        pageData: processRenderedPageSync(imageData, isHQ, options)
+    };
+}
+
+function processRenderedPageAsync(imageData, pageNum, isHQ, options) {
+    return new Promise(function(resolve) {
+        var id = ++exportJobId;
+        var worker = exportWorkers[exportWorkerCursor % exportWorkers.length];
+        exportWorkerCursor++;
+
+        exportCallbacks.set(id, {
+            resolve: resolve,
+            reject: function(err) {
+                resolve({
+                    pageNum: pageNum,
+                    pageData: processRenderedPageSync(imageData, isHQ, options)
+                });
+            }
+        });
+
+        worker.postMessage({
+            id: id,
+            pageNum: pageNum,
+            imageData: imageData.data.buffer.slice(0),
+            width: imageData.width,
+            height: imageData.height,
+            isHQ: isHQ,
+            options: options
+        });
+    });
+}
+
+function processRenderedPageSync(imageData, isHQ, options) {
+    var bits = isHQ ? 2 : 1;
+
+    if (options.enableDithering) {
+        imageData = applyDitheringSync(imageData, bits, options.ditherStrength);
+    }
+
+    if (options.enableNegative) {
+        applyNegative(imageData);
+    }
+
     return isHQ ? encodeXTH(imageData) : encodeXTG(imageData);
 }
 
 // ==================== Dithering ====================
-async function applyDithering(imageData, bits, strength) {
-    if (ditherWorker) {
-        return await applyDitheringAsync(imageData, bits, strength);
-    } else {
-        return applyDitheringSync(imageData, bits, strength);
-    }
-}
-
-function applyDitheringAsync(imageData, bits, strength) {
-    return new Promise(function(resolve) {
-        var id = ++ditherJobId;
-        ditherCallbacks.set(id, function(resultData) {
-            resolve(new ImageData(
-                new Uint8ClampedArray(resultData),
-                imageData.width,
-                imageData.height
-            ));
-        });
-
-        ditherWorker.postMessage({
-            imageData: imageData.data.buffer.slice(0),
-            width: imageData.width,
-            height: imageData.height,
-            bits: bits,
-            strength: strength,
-            id: id
-        });
-    });
-}
 
 function applyDitheringSync(imageData, bits, strength) {
     var data = imageData.data;
@@ -1611,19 +1734,14 @@ function encodeXTH(imageData) {
 }
 
 // ==================== XTC Container ====================
-function buildXTCContainer(pages, isHQ) {
+function buildXTCContainerBlob(pages, isHQ, metadata, toc) {
     var magic = isHQ ? 'XTCH' : 'XTC\0';
-
-    // Get metadata
-    var info = renderer.getDocumentInfo();
-    var title = info.title || loadedFiles[currentFileIndex].name;
-    var author = info.author || '';
 
     // Calculate offsets
     var headerSize = 56;
     var metadataSize = 256;
     var chapterEntrySize = 96;
-    var chaptersSize = currentToc.length * chapterEntrySize;
+    var chaptersSize = toc.length * chapterEntrySize;
     var indexEntrySize = 16;
     var indexSize = pages.length * indexEntrySize;
 
@@ -1640,22 +1758,21 @@ function buildXTCContainer(pages, isHQ) {
         currentOffset += pages[i].length;
     }
 
-    var totalSize = currentOffset;
-    var buffer = new ArrayBuffer(totalSize);
-    var view = new DataView(buffer);
-    var bytes = new Uint8Array(buffer);
+    var parts = [];
+    var header = new Uint8Array(56);
+    var view = new DataView(header.buffer);
 
     // Write header (56 bytes)
     for (var i = 0; i < 4; i++) {
-        bytes[i] = magic.charCodeAt(i);
+        header[i] = magic.charCodeAt(i);
     }
     view.setUint16(4, 1, true); // Version
     view.setUint16(6, pages.length, true); // Page count
     // Individual flag bytes per XTC spec
-    bytes[8] = 0;   // readDirection (0 = L→R)
-    bytes[9] = 1;   // hasMetadata
-    bytes[10] = 0;  // hasThumbnails
-    bytes[11] = currentToc.length > 0 ? 1 : 0;  // hasChapters
+    header[8] = 0;   // readDirection (0 = L→R)
+    header[9] = 1;   // hasMetadata
+    header[10] = 0;  // hasThumbnails
+    header[11] = toc.length > 0 ? 1 : 0;  // hasChapters
     view.setUint32(12, 1, true); // Current page (1-indexed)
 
     // Use BigInt for 64-bit values
@@ -1664,52 +1781,58 @@ function buildXTCContainer(pages, isHQ) {
     view.setBigUint64(32, BigInt(pageDataOffset), true);
     view.setBigUint64(40, BigInt(0), true); // Reserved
     view.setBigUint64(48, BigInt(chapterOffset), true);
+    parts.push(header);
 
     // Write metadata (256 bytes)
     var encoder = new TextEncoder();
-    var titleBytes = encoder.encode(title.substring(0, 126));
-    var authorBytes = encoder.encode(author.substring(0, 62));
+    var titleBytes = encoder.encode((metadata.title || '').substring(0, 126));
+    var authorBytes = encoder.encode((metadata.author || '').substring(0, 62));
+    var metadataBytes = new Uint8Array(256);
+    var metadataView = new DataView(metadataBytes.buffer);
 
-    bytes.set(titleBytes, metadataOffset);
-    bytes[metadataOffset + 127] = 0; // Null terminator
-    bytes.set(authorBytes, metadataOffset + 128);
-    bytes[metadataOffset + 191] = 0; // Null terminator
-    view.setUint32(metadataOffset + 192, Math.floor(Date.now() / 1000), true); // Timestamp
-    view.setUint16(metadataOffset + 196, currentToc.length, true); // Chapter count
+    metadataBytes.set(titleBytes, 0);
+    metadataBytes[127] = 0; // Null terminator
+    metadataBytes.set(authorBytes, 128);
+    metadataBytes[191] = 0; // Null terminator
+    metadataView.setUint32(192, Math.floor(Date.now() / 1000), true); // Timestamp
+    metadataView.setUint16(196, toc.length, true); // Chapter count
+    parts.push(metadataBytes);
 
     // Write chapters
-    var chapterPos = chapterOffset;
-    for (var i = 0; i < currentToc.length; i++) {
-        var ch = currentToc[i];
+    var chapterBytes = new Uint8Array(chaptersSize);
+    var chapterView = new DataView(chapterBytes.buffer);
+    for (var i = 0; i < toc.length; i++) {
+        var ch = toc[i];
         if (!ch) continue;
         var chTitle = ch.title || ch.name || 'Chapter ' + (i + 1);
         var chPage = ch.page || ch.startPage || 0;
         var chNameBytes = encoder.encode(chTitle.substring(0, 78));
-        bytes.set(chNameBytes, chapterPos);
-        bytes[chapterPos + 79] = 0;
-        view.setUint16(chapterPos + 80, chPage + 1, true); // Start page (1-indexed)
-        view.setUint16(chapterPos + 82, chPage + 1, true); // End page (placeholder)
-        chapterPos += chapterEntrySize;
+        var chapterPos = i * chapterEntrySize;
+        chapterBytes.set(chNameBytes, chapterPos);
+        chapterBytes[chapterPos + 79] = 0;
+        chapterView.setUint16(chapterPos + 80, chPage + 1, true); // Start page (1-indexed)
+        chapterView.setUint16(chapterPos + 82, chPage + 1, true); // End page (placeholder)
     }
+    parts.push(chapterBytes);
 
     // Write index
-    var indexPos = indexOffset;
+    var indexBytes = new Uint8Array(indexSize);
+    var indexView = new DataView(indexBytes.buffer);
     for (var i = 0; i < pages.length; i++) {
-        view.setBigUint64(indexPos, BigInt(pageOffsets[i].offset), true);
-        view.setUint32(indexPos + 8, pageOffsets[i].size, true);
-        view.setUint16(indexPos + 12, SCREEN_WIDTH, true);
-        view.setUint16(indexPos + 14, SCREEN_HEIGHT, true);
-        indexPos += indexEntrySize;
+        var indexPos = i * indexEntrySize;
+        indexView.setBigUint64(indexPos, BigInt(pageOffsets[i].offset), true);
+        indexView.setUint32(indexPos + 8, pageOffsets[i].size, true);
+        indexView.setUint16(indexPos + 12, SCREEN_WIDTH, true);
+        indexView.setUint16(indexPos + 14, SCREEN_HEIGHT, true);
     }
+    parts.push(indexBytes);
 
     // Write page data
-    var dataPos = pageDataOffset;
     for (var i = 0; i < pages.length; i++) {
-        bytes.set(pages[i], dataPos);
-        dataPos += pages[i].length;
+        parts.push(pages[i]);
     }
 
-    return bytes;
+    return new Blob(parts, { type: 'application/octet-stream' });
 }
 
 // ==================== EPUB Optimizer ====================

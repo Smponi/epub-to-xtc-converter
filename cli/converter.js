@@ -5,8 +5,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { applyDithering, applyNegative } = require('./dither');
-const { encodeXTG, encodeXTH, buildXTCContainer } = require('./encoder');
+const { XTCStreamWriter } = require('./stream-writer');
+const { PageProcessorPool, getWorkerCount } = require('./page-pipeline');
 
 let Module = null;
 let renderer = null;
@@ -156,7 +156,6 @@ function renderPage(pageNum) {
 async function convertEpub(epubPath, outputPath, settings, progressCallback) {
     const { width, height, output } = settings;
     const isHQ = output.format === 'xtch';
-    const bits = isHQ ? 2 : 1;
 
     // Initialize and setup
     await initWasm();
@@ -178,50 +177,116 @@ async function convertEpub(epubPath, outputPath, settings, progressCallback) {
     // Re-get page count after settings (pagination may change)
     const totalPages = renderer.getPageCount();
 
-    // Render all pages
-    const pages = [];
-    for (let i = 0; i < totalPages; i++) {
-        // Render page
-        let imageData = renderPage(i);
-
-        // Apply dithering if enabled
-        if (output.dithering) {
-            imageData = applyDithering(imageData, width, height, bits, output.ditherStrength);
-        }
-
-        // Apply negative if enabled
-        if (output.negative) {
-            applyNegative(imageData);
-        }
-
-        // Encode page
-        const encoded = isHQ
-            ? encodeXTH(imageData, width, height)
-            : encodeXTG(imageData, width, height);
-        pages.push(encoded);
-
-        // Progress callback
-        if (progressCallback) {
-            progressCallback(i + 1, totalPages);
-        }
-    }
-
-    // Build container
     const metadata = {
         title: info.title || path.basename(epubPath, '.epub'),
         author: info.author || info.authors || ''
     };
 
-    const container = buildXTCContainer(pages, metadata, toc, width, height, isHQ);
+    const workerCount = getWorkerCount(totalPages);
+    const pool = new PageProcessorPool({
+        width,
+        height,
+        isHQ,
+        output,
+        workerCount
+    });
+    const writer = new XTCStreamWriter(outputPath, {
+        metadata,
+        toc,
+        width,
+        height,
+        isHQ,
+        pageCount: totalPages
+    });
 
-    // Write output
-    fs.writeFileSync(outputPath, container);
+    const completedPages = new Map();
+    let nextPageToWrite = 0;
+    let scheduledPages = 0;
+    let waiter = null;
+    let processingError = null;
 
-    return {
-        outputPath,
-        pageCount: totalPages,
-        format: output.format
-    };
+    function notifyWaiter() {
+        if (waiter) {
+            const resolve = waiter;
+            waiter = null;
+            resolve();
+        }
+    }
+
+    function waitForCompletion() {
+        if (processingError) {
+            return Promise.reject(processingError);
+        }
+        return new Promise((resolve) => {
+            waiter = resolve;
+        });
+    }
+
+    async function flushReady(waitForNext) {
+        while (!completedPages.has(nextPageToWrite)) {
+            if (!waitForNext) {
+                return;
+            }
+            await waitForCompletion();
+            if (processingError) {
+                throw processingError;
+            }
+        }
+
+        while (completedPages.has(nextPageToWrite)) {
+            const encoded = completedPages.get(nextPageToWrite);
+            completedPages.delete(nextPageToWrite);
+            writer.appendPage(encoded);
+
+            if (progressCallback) {
+                progressCallback(nextPageToWrite + 1, totalPages);
+            }
+
+            nextPageToWrite++;
+        }
+    }
+
+    const maxInFlight = Math.max(2, workerCount > 0 ? workerCount * 2 : 2);
+
+    try {
+        // Render all pages, but keep post-processing bounded so we don't balloon memory.
+        for (let i = 0; i < totalPages; i++) {
+            const imageData = renderPage(i);
+            scheduledPages++;
+
+            pool.processPage(i, imageData)
+                .then((result) => {
+                    completedPages.set(result.pageIndex, result.encoded);
+                    notifyWaiter();
+                })
+                .catch((err) => {
+                    processingError = err;
+                    notifyWaiter();
+                });
+
+            if (scheduledPages - nextPageToWrite >= maxInFlight) {
+                await flushReady(true);
+            } else {
+                await flushReady(false);
+            }
+        }
+
+        while (nextPageToWrite < totalPages) {
+            await flushReady(true);
+        }
+
+        writer.finish();
+
+        return {
+            outputPath,
+            pageCount: totalPages,
+            format: output.format,
+            workersUsed: workerCount
+        };
+    } finally {
+        await pool.close();
+        writer.close();
+    }
 }
 
 /**

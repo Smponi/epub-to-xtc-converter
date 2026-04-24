@@ -257,6 +257,9 @@ async function convertSingleFile(inputPath, outputPath, settings) {
     console.log(`\n  Output: ${result.outputPath}`);
     console.log(`  Pages: ${result.pageCount}`);
     console.log(`  Format: ${result.format.toUpperCase()}`);
+    if (typeof result.workersUsed === 'number') {
+        console.log(`  Pipeline: streamed export + ${result.workersUsed} worker(s)`);
+    }
 }
 
 async function convertDirectory(inputDir, outputDir, settings) {
@@ -300,6 +303,9 @@ async function convertDirectory(inputDir, outputDir, settings) {
 
             console.log(`\n  Output: ${path.basename(result.outputPath)}`);
             console.log(`  Pages: ${result.pageCount}\n`);
+            if (typeof result.workersUsed === 'number') {
+                console.log(`  Pipeline: streamed export + ${result.workersUsed} worker(s)\n`);
+            }
             successCount++;
 
         } catch (err) {
