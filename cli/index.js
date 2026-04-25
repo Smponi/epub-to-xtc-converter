@@ -24,6 +24,7 @@ program
     .option('-o, --output <path>', 'Output file or directory')
     .option('-c, --config <path>', 'Path to settings JSON file')
     .option('-f, --format <format>', 'Output format: xtc (1-bit) or xtch (2-bit)')
+    .option('--adaptive-monochrome', 'Prefer 1-bit pages inside XTCH when gray coverage is low')
     .action(async (input, options) => {
         try {
             // Load and resolve settings
@@ -33,6 +34,10 @@ program
             // Override format if specified
             if (options.format) {
                 settings.output.format = options.format;
+            }
+
+            if (options.adaptiveMonochrome) {
+                settings.output.adaptiveMonochrome = true;
             }
 
             // Validate settings
@@ -131,7 +136,21 @@ program
     });
 
 function formatSize(bytes) {
-    return (bytes / 1024).toFixed(1) + ' KB';
+    if (!Number.isFinite(bytes)) {
+        return '0 B';
+    }
+
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = bytes;
+    let unitIndex = 0;
+
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+    }
+
+    const decimals = unitIndex === 0 ? 0 : 1;
+    return `${value.toFixed(decimals)} ${units[unitIndex]}`;
 }
 
 async function optimizeSingleFile(inputPath, outputPath, opts) {
@@ -257,6 +276,21 @@ async function convertSingleFile(inputPath, outputPath, settings) {
     console.log(`\n  Output: ${result.outputPath}`);
     console.log(`  Pages: ${result.pageCount}`);
     console.log(`  Format: ${result.format.toUpperCase()}`);
+    if (typeof result.outputSize === 'number') {
+        console.log(`  Size: ${formatSize(result.outputSize)}`);
+    }
+    if (result.storedPageFormats) {
+        console.log(`  Stored pages: ${result.storedPageFormats.xtg} XTG, ${result.storedPageFormats.xth} XTH`);
+    }
+    if (result.strictMonochromePages > 0 || result.adaptiveMonochromePages > 0) {
+        console.log(`  Auto-mono: ${result.strictMonochromePages} lossless, ${result.adaptiveMonochromePages} adaptive`);
+    }
+    if (result.monochromeSavedBytes > 0) {
+        console.log(`  Mono savings: ${formatSize(result.monochromeSavedBytes)} vs full XTCH`);
+    }
+    if (result.deduplicatedPages > 0) {
+        console.log(`  Reused pages: ${result.deduplicatedPages} (${formatSize(result.reusedDataBytes)} avoided)`);
+    }
     if (typeof result.workersUsed === 'number') {
         console.log(`  Pipeline: streamed export + ${result.workersUsed} worker(s)`);
     }
@@ -303,6 +337,21 @@ async function convertDirectory(inputDir, outputDir, settings) {
 
             console.log(`\n  Output: ${path.basename(result.outputPath)}`);
             console.log(`  Pages: ${result.pageCount}\n`);
+            if (typeof result.outputSize === 'number') {
+                console.log(`  Size: ${formatSize(result.outputSize)}`);
+            }
+            if (result.storedPageFormats) {
+                console.log(`  Stored pages: ${result.storedPageFormats.xtg} XTG, ${result.storedPageFormats.xth} XTH`);
+            }
+            if (result.strictMonochromePages > 0 || result.adaptiveMonochromePages > 0) {
+                console.log(`  Auto-mono: ${result.strictMonochromePages} lossless, ${result.adaptiveMonochromePages} adaptive`);
+            }
+            if (result.monochromeSavedBytes > 0) {
+                console.log(`  Mono savings: ${formatSize(result.monochromeSavedBytes)} vs full XTCH`);
+            }
+            if (result.deduplicatedPages > 0) {
+                console.log(`  Reused pages: ${result.deduplicatedPages} (${formatSize(result.reusedDataBytes)} avoided)`);
+            }
             if (typeof result.workersUsed === 'number') {
                 console.log(`  Pipeline: streamed export + ${result.workersUsed} worker(s)\n`);
             }

@@ -46,7 +46,8 @@ const DEFAULT_SETTINGS = {
         format: 'xtc',  // 'xtc' (1-bit) or 'xtch' (2-bit)
         dithering: true,
         ditherStrength: 0.7,
-        negative: false
+        negative: false,
+        adaptiveMonochrome: false
     },
     optimizer: {
         removeCss: true,
@@ -141,6 +142,11 @@ function validateSettings(settings) {
 
     if (settings.output.ditherStrength < 0 || settings.output.ditherStrength > 1) {
         errors.push('Dither strength must be between 0 and 1');
+    }
+
+    if (settings.output.adaptiveMonochrome !== undefined &&
+        typeof settings.output.adaptiveMonochrome !== 'boolean') {
+        errors.push('output.adaptiveMonochrome must be true or false');
     }
 
     const validFormats = ['xtc', 'xtch'];

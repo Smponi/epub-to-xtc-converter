@@ -11,6 +11,7 @@ let exportWorkers = [];
 let exportCallbacks = new Map();
 let exportJobId = 0;
 let exportWorkerCursor = 0;
+let lastExportStats = null;
 
 // Device presets
 const DEVICES = {
@@ -65,6 +66,24 @@ const enableDithering = document.getElementById('enableDithering');
 const ditherStrength = document.getElementById('ditherStrength');
 const ditherStrengthNum = document.getElementById('ditherStrengthNum');
 const enableNegative = document.getElementById('enableNegative');
+const adaptiveMonochrome = document.getElementById('adaptiveMonochrome');
+const adaptiveMonochromeNote = document.getElementById('adaptiveMonochromeNote');
+const statsEstimatedBookSize = document.getElementById('statsEstimatedBookSize');
+const statsEstimatedCopy = document.getElementById('statsEstimatedCopy');
+const statsPerPage = document.getElementById('statsPerPage');
+const statsPerPageMeta = document.getElementById('statsPerPageMeta');
+const statsMode = document.getElementById('statsMode');
+const statsModeMeta = document.getElementById('statsModeMeta');
+const statsActualSize = document.getElementById('statsActualSize');
+const statsActualMeta = document.getElementById('statsActualMeta');
+const statsSavedTotal = document.getElementById('statsSavedTotal');
+const statsSavedMeta = document.getElementById('statsSavedMeta');
+const statsXtgPages = document.getElementById('statsXtgPages');
+const statsXthPages = document.getElementById('statsXthPages');
+const statsLosslessSaved = document.getElementById('statsLosslessSaved');
+const statsAdaptiveSaved = document.getElementById('statsAdaptiveSaved');
+const statsDedupeSaved = document.getElementById('statsDedupeSaved');
+const statsUniquePages = document.getElementById('statsUniquePages');
 
 // Progress bar settings
 const enableProgressBar = document.getElementById('enableProgressBar');
@@ -224,7 +243,8 @@ function initExportWorkers() {
 
                 callback.resolve({
                     pageNum: data.pageNum,
-                    pageData: new Uint8Array(data.pageData)
+                    pageData: new Uint8Array(data.pageData),
+                    pageStats: data.pageStats
                 });
             };
             worker.onerror = function(err) {
@@ -243,6 +263,137 @@ function initExportWorkers() {
         exportWorkers = [];
         console.warn('Export workers not available, using sync fallback');
     }
+}
+
+function getXTGPageSize(width, height) {
+    return 22 + (Math.ceil(width / 8) * height);
+}
+
+function getXTHPageSize(width, height) {
+    return 22 + (Math.ceil(height / 8) * width * 2);
+}
+
+function getContainerOverheadBytes(pageCount, chapterCount) {
+    return 56 + 256 + (chapterCount * 96) + (pageCount * 16);
+}
+
+function getOutputOptions() {
+    return {
+        enableDithering: enableDithering.checked,
+        ditherStrength: parseInt(ditherStrength.value) / 100,
+        enableNegative: enableNegative.checked,
+        adaptiveMonochrome: adaptiveMonochrome.checked
+    };
+}
+
+function createExportStatsAccumulator(isHQ, pageCount, width, height, chapterCount) {
+    return {
+        isHQ: isHQ,
+        pageCount: pageCount,
+        width: width,
+        height: height,
+        chapterCount: chapterCount,
+        xtgPageBytes: getXTGPageSize(width, height),
+        xthPageBytes: getXTHPageSize(width, height),
+        storedPageFormats: { xtg: 0, xth: 0 },
+        strictMonochromePages: 0,
+        adaptiveMonochromePages: 0,
+        grayscalePages: 0,
+        strictMonochromeSavedBytes: 0,
+        adaptiveMonochromeSavedBytes: 0,
+        totalEncodedPageBytes: 0
+    };
+}
+
+function recordPageEncodingStats(accumulator, pageStats) {
+    if (!pageStats) {
+        return;
+    }
+
+    accumulator.totalEncodedPageBytes += pageStats.pageBytes;
+
+    if (accumulator.storedPageFormats[pageStats.pageFormat] !== undefined) {
+        accumulator.storedPageFormats[pageStats.pageFormat]++;
+    }
+
+    if (pageStats.strategy === 'strict-monochrome') {
+        accumulator.strictMonochromePages++;
+        accumulator.strictMonochromeSavedBytes += Math.max(0, pageStats.xthBytes - pageStats.pageBytes);
+        return;
+    }
+
+    if (pageStats.strategy === 'adaptive-monochrome') {
+        accumulator.adaptiveMonochromePages++;
+        accumulator.adaptiveMonochromeSavedBytes += Math.max(0, pageStats.xthBytes - pageStats.pageBytes);
+        return;
+    }
+
+    if (pageStats.strategy === 'grayscale') {
+        accumulator.grayscalePages++;
+    }
+}
+
+function invalidateExportStats() {
+    lastExportStats = null;
+    updateExportStatsPanel();
+}
+
+function updateExportStatsPanel() {
+    var isHQ = qualityMode.value === 'hq';
+    var pageCount = totalPages || 0;
+    var chapterCount = currentToc ? currentToc.length : 0;
+    var perPageBytes = isHQ ? getXTHPageSize(SCREEN_WIDTH, SCREEN_HEIGHT) : getXTGPageSize(SCREEN_WIDTH, SCREEN_HEIGHT);
+    var overheadBytes = getContainerOverheadBytes(pageCount, chapterCount);
+    var estimatedOutputSize = overheadBytes + (pageCount * perPageBytes);
+
+    statsEstimatedBookSize.textContent = pageCount > 0 ? formatByteSize(estimatedOutputSize) : '0 B';
+    statsPerPage.textContent = formatByteSize(perPageBytes);
+    statsPerPageMeta.textContent = SCREEN_WIDTH + 'x' + SCREEN_HEIGHT + (isHQ ? ' XTCH ceiling' : ' XTC fixed size');
+    statsMode.textContent = isHQ ? 'XTCH' : 'XTC';
+    statsModeMeta.textContent = isHQ
+        ? (adaptiveMonochrome.checked ? '2-bit target with adaptive 1-bit fallback' : '2-bit grayscale pages')
+        : '1-bit monochrome pages';
+
+    if (pageCount === 0) {
+        statsEstimatedCopy.textContent = 'Load a book to see the current export ceiling for this preset.';
+    } else if (isHQ && adaptiveMonochrome.checked) {
+        statsEstimatedCopy.textContent = 'This is the all-2-bit ceiling. Adaptive monochrome and page reuse can only bring the real export below it.';
+    } else {
+        statsEstimatedCopy.textContent = 'This is the raw container ceiling for the current preset before any page reuse or adaptive mono kicks in.';
+    }
+
+    if (!lastExportStats) {
+        statsActualSize.textContent = '-';
+        statsActualMeta.textContent = 'Export once to compare estimate vs actual';
+        statsSavedTotal.textContent = '-';
+        statsSavedMeta.textContent = pageCount > 0 ? 'No measured export for the current settings yet' : 'No book loaded';
+        statsXtgPages.textContent = '-';
+        statsXthPages.textContent = '-';
+        statsLosslessSaved.textContent = '-';
+        statsAdaptiveSaved.textContent = !isHQ
+            ? 'XTC already uses 1-bit pages'
+            : (adaptiveMonochrome.checked ? '-' : 'Enable adaptive mono to track this');
+        statsDedupeSaved.textContent = '-';
+        statsUniquePages.textContent = '-';
+        return;
+    }
+
+    statsActualSize.textContent = formatByteSize(lastExportStats.outputSize);
+    statsActualMeta.textContent = 'Saved ' + formatByteSize(lastExportStats.totalSavingsBytes) + ' vs current all-page ceiling';
+    statsSavedTotal.textContent = formatByteSize(lastExportStats.totalSavingsBytes);
+    statsSavedMeta.textContent = lastExportStats.deduplicatedPages > 0
+        ? lastExportStats.deduplicatedPages + ' repeated page' + (lastExportStats.deduplicatedPages === 1 ? '' : 's') + ' were reused'
+        : 'No repeated pages were reused in the last export';
+    statsXtgPages.textContent = String(lastExportStats.storedPageFormats.xtg);
+    statsXthPages.textContent = String(lastExportStats.storedPageFormats.xth);
+    statsLosslessSaved.textContent = formatByteSize(lastExportStats.strictMonochromeSavedBytes);
+    statsAdaptiveSaved.textContent = formatByteSize(lastExportStats.adaptiveMonochromeSavedBytes);
+    statsDedupeSaved.textContent = formatByteSize(
+        lastExportStats.reusedDataBytes !== undefined
+            ? lastExportStats.reusedDataBytes
+            : lastExportStats.reusedBytes
+    );
+    statsUniquePages.textContent = lastExportStats.uniqueStoredPages + ' / ' + lastExportStats.pageCount;
 }
 
 // ==================== File Handling ====================
@@ -396,6 +547,7 @@ async function switchToFile(index) {
         exportAllBtn.disabled = false;
 
         fileData.loaded = true;
+        invalidateExportStats();
         renderCurrentPage();
 
     } catch (err) {
@@ -412,12 +564,15 @@ function clearPreview() {
     bookTitle.textContent = 'No book loaded';
     bookAuthor.textContent = 'Drop an EPUB file to start';
     pageInfo.textContent = 'Page 0 / 0';
+    totalPages = 0;
+    currentToc = [];
     showNoChaptersMessage();
     exportBtn.disabled = true;
     exportPageBtn.disabled = true;
     exportAllBtn.disabled = true;
     prevBtn.disabled = true;
     nextBtn.disabled = true;
+    invalidateExportStats();
 }
 
 function showNoChaptersMessage() {
@@ -936,6 +1091,7 @@ function setupSettings() {
     // Text align change
     textAlign.addEventListener('change', function() {
         applySettings();
+        invalidateExportStats();
         renderCurrentPage();
     });
 
@@ -944,12 +1100,14 @@ function setupSettings() {
         var langGroup = document.getElementById('hyphenationLangGroup');
         langGroup.style.display = hyphenation.value === '0' ? 'none' : 'block';
         applySettings();
+        invalidateExportStats();
         renderCurrentPage();
     });
 
     // Hyphenation language change
     hyphenationLang.addEventListener('change', function() {
         applySettings();
+        invalidateExportStats();
         renderCurrentPage();
     });
 
@@ -957,27 +1115,44 @@ function setupSettings() {
     document.getElementById('hyphenationLangGroup').style.display =
         hyphenation.value === '0' ? 'none' : 'block';
 
-    // Quality mode
-    qualityMode.addEventListener('change', function() {
+    function updateExportModeControls() {
         document.getElementById('ditherStrengthGroup').style.display =
             enableDithering.checked ? 'block' : 'none';
+        adaptiveMonochrome.disabled = qualityMode.value !== 'hq';
+        adaptiveMonochromeNote.textContent = qualityMode.value === 'hq'
+            ? 'In XTCH mode, pages with very little gray detail can collapse to 1-bit for much smaller files.'
+            : 'Adaptive monochrome only applies to XTCH exports. XTC is already fully 1-bit.';
+        updateExportStatsPanel();
+    }
+
+    // Quality mode
+    qualityMode.addEventListener('change', function() {
+        invalidateExportStats();
+        updateExportModeControls();
     });
 
     // Dithering toggle
     enableDithering.addEventListener('change', function() {
-        document.getElementById('ditherStrengthGroup').style.display =
-            enableDithering.checked ? 'block' : 'none';
+        invalidateExportStats();
+        updateExportModeControls();
     });
 
     // Negative (dark mode) toggle
     enableNegative.addEventListener('change', function() {
+        invalidateExportStats();
         renderCurrentPage();
+    });
+
+    adaptiveMonochrome.addEventListener('change', function() {
+        invalidateExportStats();
+        updateExportModeControls();
     });
 
     // Progress bar toggle - re-render to show/hide our custom status bar
     enableProgressBar.addEventListener('change', function() {
         document.getElementById('progressSettings').style.display =
             enableProgressBar.checked ? 'block' : 'none';
+        invalidateExportStats();
         renderCurrentPage();
     });
 
@@ -989,10 +1164,13 @@ function setupSettings() {
     progressBarCheckboxes.forEach(function(el) {
         if (el) {
             el.addEventListener('change', function() {
+                invalidateExportStats();
                 renderCurrentPage();
             });
         }
     });
+
+    updateExportModeControls();
 
     // Tabs
     var tabBtns = document.querySelectorAll('.tabs button');
@@ -1026,10 +1204,12 @@ function syncInputs(slider, num, valueId) {
 
     slider.addEventListener('change', function() {
         applySettings();
+        invalidateExportStats();
         renderCurrentPage();
     });
     num.addEventListener('change', function() {
         applySettings();
+        invalidateExportStats();
         renderCurrentPage();
     });
 }
@@ -1041,12 +1221,14 @@ function syncInputsRenderOnly(slider, num, valueId) {
     slider.addEventListener('input', function() {
         num.value = slider.value;
         if (valueEl) valueEl.textContent = slider.value;
+        invalidateExportStats();
         renderCurrentPage();
     });
 
     num.addEventListener('input', function() {
         slider.value = num.value;
         if (valueEl) valueEl.textContent = num.value;
+        invalidateExportStats();
         renderCurrentPage();
     });
 }
@@ -1059,6 +1241,7 @@ function updateCanvasSize() {
 
     previewCanvas.width = SCREEN_WIDTH;
     previewCanvas.height = SCREEN_HEIGHT;
+    invalidateExportStats();
 
     if (renderer) {
         renderer.resize(SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -1095,13 +1278,15 @@ async function exportXTC() {
     progressFill.style.width = '0%';
 
     try {
-        var xtcData = await generateXTC(function(progress, page) {
+        var exportResult = await generateXTC(function(progress, page) {
             progressFill.style.width = progress + '%';
             progressText.textContent = 'Processing page ' + page + ' / ' + totalPages;
         });
 
-        downloadFile(xtcData, filename);
-        progressText.textContent = 'Export complete!';
+        lastExportStats = exportResult.stats;
+        updateExportStatsPanel();
+        downloadFile(exportResult.blob, filename);
+        progressText.textContent = buildExportCompleteMessage(exportResult.stats);
 
     } catch (err) {
         console.error('Export failed:', err);
@@ -1116,10 +1301,11 @@ async function exportXTC() {
 async function exportCurrentPage() {
     if (!renderer) return;
 
-    var isHQ = qualityMode.value === 'hq';
     var pageData = await renderPageForExport(currentPage);
+    var pageFormat = getEncodedPageFormat(pageData);
+    var extension = pageFormat === 'xth' ? 'xth' : 'xtg';
 
-    var filename = 'page_' + (currentPage + 1) + '.' + (isHQ ? 'xth' : 'xtg');
+    var filename = 'page_' + (currentPage + 1) + '.' + extension;
     downloadFile(pageData, filename);
 }
 
@@ -1137,13 +1323,15 @@ async function exportAllFiles() {
 
         await switchToFile(i);
 
-        var xtcData = await generateXTC(function(progress, page) {
+        var exportResult = await generateXTC(function(progress, page) {
             var overallProgress = ((i + progress / 100) / loadedFiles.length) * 100;
             progressFill.style.width = overallProgress + '%';
         });
 
+        lastExportStats = exportResult.stats;
+        updateExportStatsPanel();
         var filename = loadedFiles[i].name.replace('.epub', '.' + extension);
-        zip.file(filename, xtcData);
+        zip.file(filename, exportResult.blob);
     }
 
     progressText.textContent = 'Creating ZIP file...';
@@ -1161,6 +1349,7 @@ async function generateXTC(progressCallback) {
     var metadata = getExportMetadata();
     var toc = currentToc.slice();
     var pages = new Array(totalPages);
+    var exportStats = createExportStatsAccumulator(isHQ, totalPages, SCREEN_WIDTH, SCREEN_HEIGHT, toc.length);
     var completedPages = new Map();
     var nextPageToStore = 0;
     var scheduledPages = 0;
@@ -1197,8 +1386,10 @@ async function generateXTC(progressCallback) {
         }
 
         while (completedPages.has(nextPageToStore)) {
-            pages[nextPageToStore] = completedPages.get(nextPageToStore);
+            var processedPage = completedPages.get(nextPageToStore);
             completedPages.delete(nextPageToStore);
+            pages[nextPageToStore] = processedPage.pageData;
+            recordPageEncodingStats(exportStats, processedPage.pageStats);
 
             if (progressCallback) {
                 progressCallback((nextPageToStore + 1) / totalPages * 100, nextPageToStore + 1);
@@ -1214,7 +1405,7 @@ async function generateXTC(progressCallback) {
 
         processRenderedPageForExport(imageData, i, isHQ)
             .then(function(result) {
-                completedPages.set(result.pageNum, result.pageData);
+                completedPages.set(result.pageNum, result);
                 notifyWaiter();
             })
             .catch(function(err) {
@@ -1233,7 +1424,7 @@ async function generateXTC(progressCallback) {
         await flushReady(true);
     }
 
-    return buildXTCContainerBlob(pages, isHQ, metadata, toc);
+    return buildXTCContainerBlob(pages, isHQ, metadata, toc, exportStats);
 }
 
 async function renderPageForExport(pageNum) {
@@ -1275,11 +1466,7 @@ function getExportMetadata() {
 }
 
 async function processRenderedPageForExport(imageData, pageNum, isHQ) {
-    var options = {
-        enableDithering: enableDithering.checked,
-        ditherStrength: parseInt(ditherStrength.value) / 100,
-        enableNegative: enableNegative.checked
-    };
+    var options = getOutputOptions();
 
     if (exportWorkers.length > 0) {
         return await processRenderedPageAsync(imageData, pageNum, isHQ, options);
@@ -1287,7 +1474,7 @@ async function processRenderedPageForExport(imageData, pageNum, isHQ) {
 
     return {
         pageNum: pageNum,
-        pageData: processRenderedPageSync(imageData, isHQ, options)
+        ...processRenderedPageSync(imageData, isHQ, options)
     };
 }
 
@@ -1302,7 +1489,7 @@ function processRenderedPageAsync(imageData, pageNum, isHQ, options) {
             reject: function(err) {
                 resolve({
                     pageNum: pageNum,
-                    pageData: processRenderedPageSync(imageData, isHQ, options)
+                    ...processRenderedPageSync(imageData, isHQ, options)
                 });
             }
         });
@@ -1330,7 +1517,7 @@ function processRenderedPageSync(imageData, isHQ, options) {
         applyNegative(imageData);
     }
 
-    return isHQ ? encodeXTH(imageData) : encodeXTG(imageData);
+    return encodePage(imageData, isHQ, options);
 }
 
 // ==================== Dithering ====================
@@ -1621,6 +1808,133 @@ function drawProgressBar(imageData, pageNum) {
 }
 
 // ==================== XTG/XTH Encoding ====================
+function isStrictMonochromeImage(imageData) {
+    return analyzeQuantizedPage(imageData).isStrictMonochrome;
+}
+
+function getQuantizedGrayLevel(gray) {
+    if (gray > 212) return 255;
+    if (gray > 127) return 170;
+    if (gray > 42) return 85;
+    return 0;
+}
+
+function analyzeQuantizedPage(imageData) {
+    var data = imageData.data;
+    var pixelCount = imageData.width * imageData.height;
+    var blackPixels = 0;
+    var darkGrayPixels = 0;
+    var lightGrayPixels = 0;
+    var whitePixels = 0;
+
+    for (var i = 0; i < pixelCount; i++) {
+        var level = getQuantizedGrayLevel(data[i * 4]);
+
+        if (level === 0) blackPixels++;
+        else if (level === 85) darkGrayPixels++;
+        else if (level === 170) lightGrayPixels++;
+        else whitePixels++;
+    }
+
+    var nonBinaryPixels = darkGrayPixels + lightGrayPixels;
+    var nonBinaryRatio = pixelCount > 0 ? nonBinaryPixels / pixelCount : 0;
+    var dominantSurfaceRatio = pixelCount > 0
+        ? Math.max(
+            (whitePixels + lightGrayPixels) / pixelCount,
+            (blackPixels + darkGrayPixels) / pixelCount
+        )
+        : 0;
+    var extremeRatio = pixelCount > 0
+        ? (blackPixels + whitePixels) / pixelCount
+        : 0;
+
+    return {
+        pixelCount: pixelCount,
+        blackPixels: blackPixels,
+        darkGrayPixels: darkGrayPixels,
+        lightGrayPixels: lightGrayPixels,
+        whitePixels: whitePixels,
+        nonBinaryPixels: nonBinaryPixels,
+        nonBinaryRatio: nonBinaryRatio,
+        dominantSurfaceRatio: dominantSurfaceRatio,
+        extremeRatio: extremeRatio,
+        isStrictMonochrome: nonBinaryPixels === 0
+    };
+}
+
+function shouldUseAdaptiveMonochrome(analysis, options) {
+    var maxNonBinaryRatio = typeof options.adaptiveMonochromeMaxNonBinaryRatio === 'number'
+        ? options.adaptiveMonochromeMaxNonBinaryRatio
+        : 0.12;
+    var minDominantSurfaceRatio = typeof options.adaptiveMonochromeMinDominantSurfaceRatio === 'number'
+        ? options.adaptiveMonochromeMinDominantSurfaceRatio
+        : 0.72;
+    var minExtremeRatio = typeof options.adaptiveMonochromeMinExtremeRatio === 'number'
+        ? options.adaptiveMonochromeMinExtremeRatio
+        : 0.55;
+
+    return analysis.nonBinaryRatio <= maxNonBinaryRatio &&
+        analysis.dominantSurfaceRatio >= minDominantSurfaceRatio &&
+        analysis.extremeRatio >= minExtremeRatio;
+}
+
+function encodePage(imageData, isHQ, options) {
+    var xtgBytes = getXTGPageSize(imageData.width, imageData.height);
+    var xthBytes = getXTHPageSize(imageData.width, imageData.height);
+
+    if (!isHQ) {
+        return {
+            pageData: encodeXTG(imageData),
+            pageStats: {
+                strategy: 'xtc-monochrome',
+                pageFormat: 'xtg',
+                pageBytes: xtgBytes,
+                xtgBytes: xtgBytes,
+                xthBytes: xthBytes
+            }
+        };
+    }
+
+    var analysis = analyzeQuantizedPage(imageData);
+
+    if (analysis.isStrictMonochrome) {
+        return {
+            pageData: encodeXTG(imageData),
+            pageStats: {
+                strategy: 'strict-monochrome',
+                pageFormat: 'xtg',
+                pageBytes: xtgBytes,
+                xtgBytes: xtgBytes,
+                xthBytes: xthBytes
+            }
+        };
+    }
+
+    if (options.adaptiveMonochrome && shouldUseAdaptiveMonochrome(analysis, options)) {
+        return {
+            pageData: encodeXTG(imageData),
+            pageStats: {
+                strategy: 'adaptive-monochrome',
+                pageFormat: 'xtg',
+                pageBytes: xtgBytes,
+                xtgBytes: xtgBytes,
+                xthBytes: xthBytes
+            }
+        };
+    }
+
+    return {
+        pageData: encodeXTH(imageData),
+        pageStats: {
+            strategy: 'grayscale',
+            pageFormat: 'xth',
+            pageBytes: xthBytes,
+            xtgBytes: xtgBytes,
+            xthBytes: xthBytes
+        }
+    };
+}
+
 function encodeXTG(imageData) {
     // XTG: 1-bit monochrome, row-major, MSB = leftmost pixel
     var width = imageData.width;
@@ -1734,7 +2048,141 @@ function encodeXTH(imageData) {
 }
 
 // ==================== XTC Container ====================
-function buildXTCContainerBlob(pages, isHQ, metadata, toc) {
+function getEncodedPageFormat(pageData) {
+    if (!pageData || pageData.length < 3) {
+        return 'unknown';
+    }
+
+    if (pageData[0] !== 0x58 || pageData[1] !== 0x54) {
+        return 'unknown';
+    }
+
+    if (pageData[2] === 0x47) {
+        return 'xtg';
+    }
+
+    if (pageData[2] === 0x48) {
+        return 'xth';
+    }
+
+    return 'unknown';
+}
+
+function hashPageBytes(pageData) {
+    var hash = 2166136261;
+
+    for (var i = 0; i < pageData.length; i++) {
+        hash ^= pageData[i];
+        hash = Math.imul(hash, 16777619);
+    }
+
+    return (hash >>> 0).toString(16);
+}
+
+function arePageBytesEqual(a, b) {
+    if (!a || !b || a.length !== b.length) {
+        return false;
+    }
+
+    for (var i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function buildPageStoragePlan(pages, pageDataOffset) {
+    var pageOffsets = new Array(pages.length);
+    var storedPages = [];
+    var pageCache = new Map();
+    var currentOffset = pageDataOffset;
+    var deduplicatedPages = 0;
+    var reusedBytes = 0;
+
+    for (var i = 0; i < pages.length; i++) {
+        var pageData = pages[i];
+        var cacheKey = pageData.length + ':' + hashPageBytes(pageData);
+        var candidates = pageCache.get(cacheKey) || [];
+        var reusedEntry = null;
+
+        for (var j = 0; j < candidates.length; j++) {
+            if (arePageBytesEqual(pageData, candidates[j].pageData)) {
+                reusedEntry = candidates[j];
+                break;
+            }
+        }
+
+        if (reusedEntry) {
+            pageOffsets[i] = {
+                offset: reusedEntry.offset,
+                size: reusedEntry.size
+            };
+            deduplicatedPages++;
+            reusedBytes += pageData.length;
+            continue;
+        }
+
+        var entry = {
+            offset: currentOffset,
+            size: pageData.length,
+            pageData: pageData
+        };
+
+        pageOffsets[i] = {
+            offset: entry.offset,
+            size: entry.size
+        };
+        storedPages.push(entry);
+        candidates.push(entry);
+        pageCache.set(cacheKey, candidates);
+        currentOffset += pageData.length;
+    }
+
+    return {
+        pageOffsets: pageOffsets,
+        storedPages: storedPages,
+        deduplicatedPages: deduplicatedPages,
+        uniqueStoredPages: storedPages.length,
+        reusedBytes: reusedBytes
+    };
+}
+
+function formatByteSize(bytes) {
+    var units = ['B', 'KB', 'MB', 'GB'];
+    var value = bytes;
+    var unitIndex = 0;
+
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+    }
+
+    var decimals = unitIndex === 0 ? 0 : 1;
+    return value.toFixed(decimals) + ' ' + units[unitIndex];
+}
+
+function buildExportCompleteMessage(stats) {
+    if (!stats) {
+        return 'Export complete!';
+    }
+
+    var parts = [formatByteSize(stats.outputSize)];
+
+    if (stats.storedPageFormats) {
+        parts.push(stats.storedPageFormats.xtg + ' XTG');
+        parts.push(stats.storedPageFormats.xth + ' XTH');
+    }
+
+    if (stats.deduplicatedPages > 0) {
+        parts.push(stats.deduplicatedPages + ' reused');
+    }
+
+    return 'Export complete (' + parts.join(', ') + ')';
+}
+
+function buildXTCContainerBlob(pages, isHQ, metadata, toc, aggregateStats) {
     var magic = isHQ ? 'XTCH' : 'XTC\0';
 
     // Calculate offsets
@@ -1749,14 +2197,8 @@ function buildXTCContainerBlob(pages, isHQ, metadata, toc) {
     var chapterOffset = metadataOffset + metadataSize;
     var indexOffset = chapterOffset + chaptersSize;
     var pageDataOffset = indexOffset + indexSize;
-
-    // Build page index
-    var pageOffsets = [];
-    var currentOffset = pageDataOffset;
-    for (var i = 0; i < pages.length; i++) {
-        pageOffsets.push({ offset: currentOffset, size: pages[i].length });
-        currentOffset += pages[i].length;
-    }
+    var storagePlan = buildPageStoragePlan(pages, pageDataOffset);
+    var pageOffsets = storagePlan.pageOffsets;
 
     var parts = [];
     var header = new Uint8Array(56);
@@ -1828,11 +2270,39 @@ function buildXTCContainerBlob(pages, isHQ, metadata, toc) {
     parts.push(indexBytes);
 
     // Write page data
-    for (var i = 0; i < pages.length; i++) {
-        parts.push(pages[i]);
+    for (var i = 0; i < storagePlan.storedPages.length; i++) {
+        parts.push(storagePlan.storedPages[i].pageData);
     }
 
-    return new Blob(parts, { type: 'application/octet-stream' });
+    var blob = new Blob(parts, { type: 'application/octet-stream' });
+    var containerOverheadBytes = getContainerOverheadBytes(pages.length, toc.length);
+    var baseStats = aggregateStats || createExportStatsAccumulator(isHQ, pages.length, SCREEN_WIDTH, SCREEN_HEIGHT, toc.length);
+    var theoreticalPageBytes = pages.length * (isHQ ? baseStats.xthPageBytes : baseStats.xtgPageBytes);
+    var theoreticalOutputSize = containerOverheadBytes + theoreticalPageBytes;
+
+    return {
+        blob: blob,
+        stats: {
+            pageCount: pages.length,
+            outputSize: blob.size,
+            storedPageFormats: baseStats.storedPageFormats,
+            strictMonochromePages: baseStats.strictMonochromePages,
+            adaptiveMonochromePages: baseStats.adaptiveMonochromePages,
+            grayscalePages: baseStats.grayscalePages,
+            strictMonochromeSavedBytes: baseStats.strictMonochromeSavedBytes,
+            adaptiveMonochromeSavedBytes: baseStats.adaptiveMonochromeSavedBytes,
+            monochromeSavedBytes: baseStats.strictMonochromeSavedBytes + baseStats.adaptiveMonochromeSavedBytes,
+            totalEncodedPageBytes: baseStats.totalEncodedPageBytes,
+            containerOverheadBytes: containerOverheadBytes,
+            theoreticalOutputSize: theoreticalOutputSize,
+            encodedOutputSizeWithoutDedupe: containerOverheadBytes + baseStats.totalEncodedPageBytes,
+            totalSavingsBytes: Math.max(0, theoreticalOutputSize - blob.size),
+            uniqueStoredPages: storagePlan.uniqueStoredPages,
+            deduplicatedPages: storagePlan.deduplicatedPages,
+            reusedBytes: storagePlan.reusedBytes,
+            reusedDataBytes: storagePlan.reusedBytes
+        }
+    };
 }
 
 // ==================== EPUB Optimizer ====================
@@ -2193,6 +2663,7 @@ function setupEventListeners() {
             if (success) {
                 progressText.textContent = 'Font loaded: ' + selectedFont;
                 applySettings();
+                invalidateExportStats();
                 renderCurrentPage();
             } else {
                 progressText.textContent = 'Failed to load font: ' + selectedFont;
@@ -2203,6 +2674,7 @@ function setupEventListeners() {
             }, 1500);
         } else {
             applySettings();
+            invalidateExportStats();
             renderCurrentPage();
         }
     });
@@ -2225,6 +2697,7 @@ function setupEventListeners() {
         fontFamily.value = option.value;
 
         applySettings();
+        invalidateExportStats();
         renderCurrentPage();
     });
 }

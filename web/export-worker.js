@@ -1,5 +1,10 @@
 // Export Worker - page post-processing and XTG/XTH encoding off the main thread
 
+var XTC_PAGE_HEADER_SIZE = 22;
+var DEFAULT_ADAPTIVE_MONO_MAX_NON_BINARY_RATIO = 0.12;
+var DEFAULT_ADAPTIVE_MONO_MIN_DOMINANT_SURFACE_RATIO = 0.72;
+var DEFAULT_ADAPTIVE_MONO_MIN_EXTREME_RATIO = 0.55;
+
 self.onmessage = function(e) {
     var data = e.data;
 
@@ -10,13 +15,14 @@ self.onmessage = function(e) {
             width: data.width,
             height: data.height
         };
-        var pageData = processRenderedPage(imageData, data.isHQ, data.options);
+        var encodedResult = processRenderedPage(imageData, data.isHQ, data.options);
 
         self.postMessage({
             id: data.id,
             pageNum: data.pageNum,
-            pageData: pageData.buffer
-        }, [pageData.buffer]);
+            pageData: encodedResult.pageData.buffer,
+            pageStats: encodedResult.pageStats
+        }, [encodedResult.pageData.buffer]);
     } catch (err) {
         self.postMessage({
             id: data.id,
@@ -36,7 +42,7 @@ function processRenderedPage(imageData, isHQ, options) {
         applyNegative(imageData);
     }
 
-    return isHQ ? encodeXTH(imageData) : encodeXTG(imageData);
+    return encodePage(imageData, isHQ, options);
 }
 
 function applyDitheringSync(imageData, bits, strength) {
@@ -90,6 +96,80 @@ function quantize(value, bits) {
     return 0;
 }
 
+function getXTGPageSize(width, height) {
+    return XTC_PAGE_HEADER_SIZE + (Math.ceil(width / 8) * height);
+}
+
+function getXTHPageSize(width, height) {
+    return XTC_PAGE_HEADER_SIZE + (Math.ceil(height / 8) * width * 2);
+}
+
+function getQuantizedGrayLevel(gray) {
+    if (gray > 212) return 255;
+    if (gray > 127) return 170;
+    if (gray > 42) return 85;
+    return 0;
+}
+
+function analyzeQuantizedPage(imageData) {
+    var data = imageData.data;
+    var pixelCount = imageData.width * imageData.height;
+    var blackPixels = 0;
+    var darkGrayPixels = 0;
+    var lightGrayPixels = 0;
+    var whitePixels = 0;
+
+    for (var i = 0; i < pixelCount; i++) {
+        var level = getQuantizedGrayLevel(data[i * 4]);
+
+        if (level === 0) blackPixels++;
+        else if (level === 85) darkGrayPixels++;
+        else if (level === 170) lightGrayPixels++;
+        else whitePixels++;
+    }
+
+    var nonBinaryPixels = darkGrayPixels + lightGrayPixels;
+    var nonBinaryRatio = pixelCount > 0 ? nonBinaryPixels / pixelCount : 0;
+    var dominantSurfaceRatio = pixelCount > 0
+        ? Math.max(
+            (whitePixels + lightGrayPixels) / pixelCount,
+            (blackPixels + darkGrayPixels) / pixelCount
+        )
+        : 0;
+    var extremeRatio = pixelCount > 0
+        ? (blackPixels + whitePixels) / pixelCount
+        : 0;
+
+    return {
+        pixelCount: pixelCount,
+        blackPixels: blackPixels,
+        darkGrayPixels: darkGrayPixels,
+        lightGrayPixels: lightGrayPixels,
+        whitePixels: whitePixels,
+        nonBinaryPixels: nonBinaryPixels,
+        nonBinaryRatio: nonBinaryRatio,
+        dominantSurfaceRatio: dominantSurfaceRatio,
+        extremeRatio: extremeRatio,
+        isStrictMonochrome: nonBinaryPixels === 0
+    };
+}
+
+function shouldUseAdaptiveMonochrome(analysis, options) {
+    var maxNonBinaryRatio = typeof options.adaptiveMonochromeMaxNonBinaryRatio === 'number'
+        ? options.adaptiveMonochromeMaxNonBinaryRatio
+        : DEFAULT_ADAPTIVE_MONO_MAX_NON_BINARY_RATIO;
+    var minDominantSurfaceRatio = typeof options.adaptiveMonochromeMinDominantSurfaceRatio === 'number'
+        ? options.adaptiveMonochromeMinDominantSurfaceRatio
+        : DEFAULT_ADAPTIVE_MONO_MIN_DOMINANT_SURFACE_RATIO;
+    var minExtremeRatio = typeof options.adaptiveMonochromeMinExtremeRatio === 'number'
+        ? options.adaptiveMonochromeMinExtremeRatio
+        : DEFAULT_ADAPTIVE_MONO_MIN_EXTREME_RATIO;
+
+    return analysis.nonBinaryRatio <= maxNonBinaryRatio &&
+        analysis.dominantSurfaceRatio >= minDominantSurfaceRatio &&
+        analysis.extremeRatio >= minExtremeRatio;
+}
+
 function applyNegative(imageData) {
     var data = imageData.data;
     for (var i = 0; i < data.length; i += 4) {
@@ -97,6 +177,67 @@ function applyNegative(imageData) {
         data[i + 1] = 255 - data[i + 1];
         data[i + 2] = 255 - data[i + 2];
     }
+}
+
+function isStrictMonochromeImage(imageData) {
+    return analyzeQuantizedPage(imageData).isStrictMonochrome;
+}
+
+function encodePage(imageData, isHQ, options) {
+    var xtgBytes = getXTGPageSize(imageData.width, imageData.height);
+    var xthBytes = getXTHPageSize(imageData.width, imageData.height);
+
+    if (!isHQ) {
+        return {
+            pageData: encodeXTG(imageData),
+            pageStats: {
+                strategy: 'xtc-monochrome',
+                pageFormat: 'xtg',
+                pageBytes: xtgBytes,
+                xtgBytes: xtgBytes,
+                xthBytes: xthBytes
+            }
+        };
+    }
+
+    var analysis = analyzeQuantizedPage(imageData);
+
+    if (analysis.isStrictMonochrome) {
+        return {
+            pageData: encodeXTG(imageData),
+            pageStats: {
+                strategy: 'strict-monochrome',
+                pageFormat: 'xtg',
+                pageBytes: xtgBytes,
+                xtgBytes: xtgBytes,
+                xthBytes: xthBytes
+            }
+        };
+    }
+
+    if (options.adaptiveMonochrome && shouldUseAdaptiveMonochrome(analysis, options)) {
+        return {
+            pageData: encodeXTG(imageData),
+            pageStats: {
+                strategy: 'adaptive-monochrome',
+                pageFormat: 'xtg',
+                pageBytes: xtgBytes,
+                xtgBytes: xtgBytes,
+                xthBytes: xthBytes
+            }
+        };
+    }
+
+    return {
+        pageData: encodeXTH(imageData),
+        pageStats: {
+            strategy: 'grayscale',
+            pageFormat: 'xth',
+            pageBytes: xthBytes,
+            xtgBytes: xtgBytes,
+            xthBytes: xthBytes
+        }
+    };
 }
 
 function encodeXTG(imageData) {

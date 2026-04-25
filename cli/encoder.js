@@ -3,6 +3,101 @@
  * Ported from web/app.js
  */
 
+const XTC_PAGE_HEADER_SIZE = 22;
+const DEFAULT_ADAPTIVE_MONO_MAX_NON_BINARY_RATIO = 0.12;
+const DEFAULT_ADAPTIVE_MONO_MIN_DOMINANT_SURFACE_RATIO = 0.72;
+const DEFAULT_ADAPTIVE_MONO_MIN_EXTREME_RATIO = 0.55;
+
+function getXTGPageSize(width, height) {
+    return XTC_PAGE_HEADER_SIZE + (Math.ceil(width / 8) * height);
+}
+
+function getXTHPageSize(width, height) {
+    return XTC_PAGE_HEADER_SIZE + (Math.ceil(height / 8) * width * 2);
+}
+
+function getQuantizedGrayLevel(gray) {
+    if (gray > 212) return 255;
+    if (gray > 127) return 170;
+    if (gray > 42) return 85;
+    return 0;
+}
+
+function analyzeQuantizedPage(data, width, height) {
+    const pixelCount = width * height;
+    let blackPixels = 0;
+    let darkGrayPixels = 0;
+    let lightGrayPixels = 0;
+    let whitePixels = 0;
+
+    for (let i = 0; i < pixelCount; i++) {
+        const level = getQuantizedGrayLevel(data[i * 4]);
+
+        if (level === 0) {
+            blackPixels++;
+        } else if (level === 85) {
+            darkGrayPixels++;
+        } else if (level === 170) {
+            lightGrayPixels++;
+        } else {
+            whitePixels++;
+        }
+    }
+
+    const nonBinaryPixels = darkGrayPixels + lightGrayPixels;
+    const nonBinaryRatio = pixelCount > 0 ? nonBinaryPixels / pixelCount : 0;
+    const dominantSurfaceRatio = pixelCount > 0
+        ? Math.max(
+            (whitePixels + lightGrayPixels) / pixelCount,
+            (blackPixels + darkGrayPixels) / pixelCount
+        )
+        : 0;
+    const extremeRatio = pixelCount > 0
+        ? (blackPixels + whitePixels) / pixelCount
+        : 0;
+
+    return {
+        pixelCount,
+        blackPixels,
+        darkGrayPixels,
+        lightGrayPixels,
+        whitePixels,
+        nonBinaryPixels,
+        nonBinaryRatio,
+        dominantSurfaceRatio,
+        extremeRatio,
+        isStrictMonochrome: nonBinaryPixels === 0
+    };
+}
+
+function shouldUseAdaptiveMonochrome(analysis, options) {
+    const maxNonBinaryRatio = Number.isFinite(options.adaptiveMonochromeMaxNonBinaryRatio)
+        ? options.adaptiveMonochromeMaxNonBinaryRatio
+        : DEFAULT_ADAPTIVE_MONO_MAX_NON_BINARY_RATIO;
+    const minDominantSurfaceRatio = Number.isFinite(options.adaptiveMonochromeMinDominantSurfaceRatio)
+        ? options.adaptiveMonochromeMinDominantSurfaceRatio
+        : DEFAULT_ADAPTIVE_MONO_MIN_DOMINANT_SURFACE_RATIO;
+    const minExtremeRatio = Number.isFinite(options.adaptiveMonochromeMinExtremeRatio)
+        ? options.adaptiveMonochromeMinExtremeRatio
+        : DEFAULT_ADAPTIVE_MONO_MIN_EXTREME_RATIO;
+
+    return analysis.nonBinaryRatio <= maxNonBinaryRatio &&
+        analysis.dominantSurfaceRatio >= minDominantSurfaceRatio &&
+        analysis.extremeRatio >= minExtremeRatio;
+}
+
+/**
+ * Check whether a processed grayscale page is strictly monochrome.
+ * When true, XTG is a lossless substitute for XTH.
+ * @param {Uint8ClampedArray} data - RGBA pixel data
+ * @param {number} width - Image width
+ * @param {number} height - Image height
+ * @returns {boolean} True when all visible pixels are black or white
+ */
+function isStrictMonochrome(data, width, height) {
+    return analyzeQuantizedPage(data, width, height).isStrictMonochrome;
+}
+
 /**
  * Encode image data to XTG format (1-bit monochrome)
  * @param {Uint8ClampedArray} data - RGBA pixel data
@@ -124,6 +219,76 @@ function encodeXTH(data, width, height) {
 }
 
 /**
+ * Encode a processed page to the smallest lossless XTC-family page format.
+ * XTCH containers may safely carry XTG payloads for fully monochrome pages.
+ * @param {Uint8ClampedArray} data - RGBA pixel data
+ * @param {number} width - Image width
+ * @param {number} height - Image height
+ * @param {boolean} isHQ - true when exporting XTCH
+ * @returns {{ pageData: Uint8Array, pageFormat: 'xtg' | 'xth' }}
+ */
+function encodePage(data, width, height, isHQ, options = {}) {
+    const xtgBytes = getXTGPageSize(width, height);
+    const xthBytes = getXTHPageSize(width, height);
+
+    if (!isHQ) {
+        return {
+            pageData: encodeXTG(data, width, height),
+            pageFormat: 'xtg',
+            stats: {
+                strategy: 'xtc-monochrome',
+                pageFormat: 'xtg',
+                pageBytes: xtgBytes,
+                xtgBytes,
+                xthBytes
+            }
+        };
+    }
+
+    const analysis = analyzeQuantizedPage(data, width, height);
+
+    if (analysis.isStrictMonochrome) {
+        return {
+            pageData: encodeXTG(data, width, height),
+            pageFormat: 'xtg',
+            stats: {
+                strategy: 'strict-monochrome',
+                pageFormat: 'xtg',
+                pageBytes: xtgBytes,
+                xtgBytes,
+                xthBytes
+            }
+        };
+    }
+
+    if (options.adaptiveMonochrome && shouldUseAdaptiveMonochrome(analysis, options)) {
+        return {
+            pageData: encodeXTG(data, width, height),
+            pageFormat: 'xtg',
+            stats: {
+                strategy: 'adaptive-monochrome',
+                pageFormat: 'xtg',
+                pageBytes: xtgBytes,
+                xtgBytes,
+                xthBytes
+            }
+        };
+    }
+
+    return {
+        pageData: encodeXTH(data, width, height),
+        pageFormat: 'xth',
+        stats: {
+            strategy: 'grayscale',
+            pageFormat: 'xth',
+            pageBytes: xthBytes,
+            xtgBytes,
+            xthBytes
+        }
+    };
+}
+
+/**
  * Build XTC/XTCH container from encoded pages
  * @param {Uint8Array[]} pages - Array of encoded XTG/XTH pages
  * @param {Object} metadata - Document metadata
@@ -237,7 +402,13 @@ function buildXTCContainer(pages, metadata, toc, width, height, isHQ) {
 }
 
 module.exports = {
+    getXTGPageSize,
+    getXTHPageSize,
+    analyzeQuantizedPage,
+    shouldUseAdaptiveMonochrome,
+    isStrictMonochrome,
     encodeXTG,
     encodeXTH,
+    encodePage,
     buildXTCContainer
 };

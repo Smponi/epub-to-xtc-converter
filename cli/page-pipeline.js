@@ -2,7 +2,7 @@ const os = require('os');
 const path = require('path');
 const { Worker } = require('worker_threads');
 const { applyDithering, applyNegative } = require('./dither');
-const { encodeXTG, encodeXTH } = require('./encoder');
+const { encodePage } = require('./encoder');
 
 function processPageData(imageData, width, height, isHQ, output) {
     const bits = isHQ ? 2 : 1;
@@ -16,9 +16,7 @@ function processPageData(imageData, width, height, isHQ, output) {
         applyNegative(processed);
     }
 
-    return isHQ
-        ? encodeXTH(processed, width, height)
-        : encodeXTG(processed, width, height);
+    return encodePage(processed, width, height, isHQ, output);
 }
 
 function getWorkerCount(totalPages) {
@@ -71,7 +69,8 @@ class PageProcessorPool {
                 }
                 task.resolve({
                     pageIndex: message.pageIndex,
-                    encoded: new Uint8Array(message.buffer, 0, message.byteLength)
+                    encoded: new Uint8Array(message.buffer, 0, message.byteLength),
+                    pageStats: message.pageStats
                 });
                 this.pumpQueue();
             });
@@ -106,7 +105,7 @@ class PageProcessorPool {
         if (this.workers.length === 0) {
             return Promise.resolve({
                 pageIndex,
-                encoded: processPageData(
+                ...processPageData(
                     imageData,
                     this.options.width,
                     this.options.height,

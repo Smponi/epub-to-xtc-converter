@@ -16,6 +16,10 @@ A tool for converting EPUB files to XTC/XTCH format and optimizing EPUBs for e-i
 ### EPUB to XTC/XTCH Converter
 - Convert EPUB books to Xteink's native XTC (1-bit) or XTCH (2-bit grayscale) format
 - Uses CREngine WASM for accurate rendering (same as CoolReader)
+- Uses lossless page-level storage optimizations during export:
+  - fully monochrome XTCH pages are stored as smaller XTG payloads
+  - identical encoded pages are stored once and referenced multiple times
+- Optional adaptive monochrome mode can also collapse low-gray XTCH pages to 1-bit when smaller files matter more than subtle grayscale detail
 - Batch processing - convert multiple files at once
 - Customizable settings:
   - Device presets (Xteink X4, X3, custom dimensions)
@@ -64,7 +68,8 @@ A tool for converting EPUB files to XTC/XTCH format and optimizing EPUBs for e-i
 - **Orientation**: Rotate output (0°, 90°, 180°, 270°)
 - **Monitor DPI**: Scale preview to match your monitor (default 96 DPI)
 - **Text Settings**: Font, size, weight, line height, margins, alignment, hyphenation language
-- **Image Settings**: Quality mode (1-bit/2-bit), dithering strength, dark mode
+- **Image Settings**: Quality mode (1-bit/2-bit), dithering strength, dark mode, optional adaptive monochrome pages for text-heavy XTCH exports
+- **Storage Stats**: Estimated export ceiling, actual export size, 1-bit/2-bit page counts, mono savings and duplicate-page reuse
 - **Progress Bar**: Book/chapter progress, page numbers (X/Y), percentages, chapter marks
 
 ### Optimizer Tab
@@ -95,6 +100,9 @@ node index.js convert ./epubs/ -o ./output/ -c settings.json
 # Use XTCH format (2-bit grayscale)
 node index.js convert book.epub -f xtch -c settings.json
 
+# Keep XTCH, but collapse low-gray pages to 1-bit when it saves space
+node index.js convert book.epub -f xtch --adaptive-monochrome -c settings.json
+
 # Optimize single EPUB for e-paper
 node index.js optimize book.epub -o book_optimized.epub -c settings.json
 
@@ -118,7 +126,13 @@ Example `settings.json`:
   "lineHeight": 120,
   "textAlign": "justify",
   "hyphenation": { "enabled": true, "language": "en" },
-  "output": { "format": "xtc", "dithering": true, "ditherStrength": 0.7 },
+  "output": {
+    "format": "xtc",
+    "dithering": true,
+    "ditherStrength": 0.7,
+    "negative": false,
+    "adaptiveMonochrome": false
+  },
   "optimizer": {
     "removeCss": true,
     "stripFonts": true,
@@ -154,6 +168,10 @@ Both formats include:
 - Document metadata (title, author)
 - Chapter navigation (TOC)
 - Page index for random access
+
+XTCH exports can also opportunistically store some pages as XTG:
+- Always, when a page is already effectively black/white
+- Optionally, when adaptive monochrome mode decides the page has very little useful gray detail
 
 See [XTC Format Specification](docs/xtc-format-spec.md) for technical details.
 

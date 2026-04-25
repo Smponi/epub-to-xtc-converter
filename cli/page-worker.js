@@ -8,7 +8,7 @@ parentPort.on('message', (message) => {
             message.byteOffset,
             message.byteLength
         );
-        const encoded = processPageData(
+        const encodedResult = processPageData(
             imageData,
             workerData.width,
             workerData.height,
@@ -19,9 +19,10 @@ parentPort.on('message', (message) => {
         parentPort.postMessage({
             taskId: message.taskId,
             pageIndex: message.pageIndex,
-            buffer: encoded.buffer,
-            byteLength: encoded.byteLength
-        }, [encoded.buffer]);
+            buffer: encodedResult.pageData.buffer,
+            byteLength: encodedResult.pageData.byteLength,
+            pageStats: encodedResult.stats
+        }, [encodedResult.pageData.buffer]);
     } catch (err) {
         parentPort.postMessage({
             taskId: message.taskId,

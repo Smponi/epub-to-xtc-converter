@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 function encodeField(text, maxChars) {
     return Buffer.from(new TextEncoder().encode((text || '').substring(0, maxChars)));
@@ -29,6 +30,13 @@ class XTCStreamWriter {
         this.pageDataOffset = this.indexOffset + indexSize;
         this.currentOffset = this.pageDataOffset;
         this.pageEntries = [];
+        this.pageCache = new Map();
+        this.stats = {
+            uniquePages: 0,
+            reusedPages: 0,
+            uniqueBytes: 0,
+            reusedBytes: 0
+        };
 
         this.fd = fs.openSync(outputPath, 'w');
         this.writeHeader(options);
@@ -95,12 +103,49 @@ class XTCStreamWriter {
     }
 
     appendPage(pageData) {
-        fs.writeSync(this.fd, pageData, 0, pageData.length, this.currentOffset);
-        this.pageEntries.push({
+        const cacheKey = `${pageData.length}:${crypto.createHash('sha1').update(pageData).digest('hex')}`;
+        const cachedEntry = this.pageCache.get(cacheKey);
+
+        if (cachedEntry) {
+            this.pageEntries.push({
+                offset: cachedEntry.offset,
+                size: cachedEntry.size
+            });
+            this.stats.reusedPages++;
+            this.stats.reusedBytes += pageData.length;
+            return {
+                deduplicated: true,
+                offset: cachedEntry.offset,
+                size: cachedEntry.size
+            };
+        }
+
+        const entry = {
             offset: this.currentOffset,
             size: pageData.length
-        });
+        };
+
+        fs.writeSync(this.fd, pageData, 0, pageData.length, this.currentOffset);
+        this.pageEntries.push(entry);
+        this.pageCache.set(cacheKey, entry);
         this.currentOffset += pageData.length;
+        this.stats.uniquePages++;
+        this.stats.uniqueBytes += pageData.length;
+
+        return {
+            deduplicated: false,
+            offset: entry.offset,
+            size: entry.size
+        };
+    }
+
+    getStats() {
+        return {
+            uniquePages: this.stats.uniquePages,
+            reusedPages: this.stats.reusedPages,
+            uniqueBytes: this.stats.uniqueBytes,
+            reusedBytes: this.stats.reusedBytes
+        };
     }
 
     finish() {
@@ -117,12 +162,14 @@ class XTCStreamWriter {
         }
 
         fs.closeSync(this.fd);
+        this.pageCache.clear();
         this.closed = true;
     }
 
     close() {
         if (this.closed) return;
         fs.closeSync(this.fd);
+        this.pageCache.clear();
         this.closed = true;
     }
 }

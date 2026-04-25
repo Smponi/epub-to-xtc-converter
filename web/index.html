@@ -226,6 +226,72 @@
                         <label for="enableNegative">Negative (Dark Mode)</label>
                     </div>
 
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="adaptiveMonochrome">
+                        <label for="adaptiveMonochrome">Adaptive Monochrome Pages</label>
+                    </div>
+                    <p class="setting-note" id="adaptiveMonochromeNote">
+                        In XTCH mode, pages with very little gray detail can collapse to 1-bit for much smaller files.
+                    </p>
+
+                    <div class="export-stats-panel" id="exportStatsPanel">
+                        <div class="export-stats-hero">
+                            <div class="export-stats-kicker">Storage Budget</div>
+                            <div class="export-stats-size" id="statsEstimatedBookSize">0 B</div>
+                            <p id="statsEstimatedCopy">Load a book to see the current export ceiling for this preset.</p>
+                        </div>
+
+                        <div class="export-stats-grid">
+                            <div class="export-stat-card">
+                                <span class="export-stat-label">Per Page</span>
+                                <strong id="statsPerPage">0 B</strong>
+                                <span class="export-stat-meta" id="statsPerPageMeta">No export mode selected</span>
+                            </div>
+                            <div class="export-stat-card">
+                                <span class="export-stat-label">Mode</span>
+                                <strong id="statsMode">XTC</strong>
+                                <span class="export-stat-meta" id="statsModeMeta">1-bit container</span>
+                            </div>
+                            <div class="export-stat-card">
+                                <span class="export-stat-label">Last Export</span>
+                                <strong id="statsActualSize">-</strong>
+                                <span class="export-stat-meta" id="statsActualMeta">Export once to compare estimate vs actual</span>
+                            </div>
+                            <div class="export-stat-card">
+                                <span class="export-stat-label">Total Saved</span>
+                                <strong id="statsSavedTotal">-</strong>
+                                <span class="export-stat-meta" id="statsSavedMeta">No savings measured yet</span>
+                            </div>
+                        </div>
+
+                        <div class="export-stats-breakdown">
+                            <div class="export-breakdown-row">
+                                <span>1-bit pages</span>
+                                <strong id="statsXtgPages">-</strong>
+                            </div>
+                            <div class="export-breakdown-row">
+                                <span>2-bit pages</span>
+                                <strong id="statsXthPages">-</strong>
+                            </div>
+                            <div class="export-breakdown-row">
+                                <span>Lossless mono wins</span>
+                                <strong id="statsLosslessSaved">-</strong>
+                            </div>
+                            <div class="export-breakdown-row">
+                                <span>Adaptive mono wins</span>
+                                <strong id="statsAdaptiveSaved">-</strong>
+                            </div>
+                            <div class="export-breakdown-row">
+                                <span>Duplicate pages skipped</span>
+                                <strong id="statsDedupeSaved">-</strong>
+                            </div>
+                            <div class="export-breakdown-row">
+                                <span>Unique page writes</span>
+                                <strong id="statsUniquePages">-</strong>
+                            </div>
+                        </div>
+                    </div>
+
                     <h2>Progress Bar</h2>
                     <div class="progress-bar-row">
                         <div class="checkbox-group">

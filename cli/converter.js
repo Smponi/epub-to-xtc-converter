@@ -7,9 +7,95 @@ const fs = require('fs');
 const path = require('path');
 const { XTCStreamWriter } = require('./stream-writer');
 const { PageProcessorPool, getWorkerCount } = require('./page-pipeline');
+const { getXTGPageSize, getXTHPageSize } = require('./encoder');
 
 let Module = null;
 let renderer = null;
+
+function getContainerOverheadBytes(pageCount, chapterCount) {
+    return 56 + 256 + (chapterCount * 96) + (pageCount * 16);
+}
+
+function createExportStatsAccumulator({ width, height, isHQ, pageCount, chapterCount }) {
+    const xtgPageBytes = getXTGPageSize(width, height);
+    const xthPageBytes = getXTHPageSize(width, height);
+
+    return {
+        pageCount,
+        chapterCount,
+        isHQ,
+        xtgPageBytes,
+        xthPageBytes,
+        storedPageFormats: { xtg: 0, xth: 0 },
+        strictMonochromePages: 0,
+        adaptiveMonochromePages: 0,
+        grayscalePages: 0,
+        strictMonochromeSavedBytes: 0,
+        adaptiveMonochromeSavedBytes: 0,
+        totalEncodedPageBytes: 0
+    };
+}
+
+function recordPageStats(accumulator, pageStats) {
+    if (!pageStats) {
+        return;
+    }
+
+    accumulator.totalEncodedPageBytes += pageStats.pageBytes;
+
+    if (accumulator.storedPageFormats[pageStats.pageFormat] !== undefined) {
+        accumulator.storedPageFormats[pageStats.pageFormat]++;
+    }
+
+    if (pageStats.strategy === 'strict-monochrome') {
+        accumulator.strictMonochromePages++;
+        accumulator.strictMonochromeSavedBytes += Math.max(0, pageStats.xthBytes - pageStats.pageBytes);
+        return;
+    }
+
+    if (pageStats.strategy === 'adaptive-monochrome') {
+        accumulator.adaptiveMonochromePages++;
+        accumulator.adaptiveMonochromeSavedBytes += Math.max(0, pageStats.xthBytes - pageStats.pageBytes);
+        return;
+    }
+
+    if (pageStats.strategy === 'grayscale') {
+        accumulator.grayscalePages++;
+    }
+}
+
+function finalizeExportStats(accumulator, writerStats, outputSize) {
+    const containerOverheadBytes = getContainerOverheadBytes(
+        accumulator.pageCount,
+        accumulator.chapterCount
+    );
+    const theoreticalPageBytes = accumulator.pageCount * (
+        accumulator.isHQ ? accumulator.xthPageBytes : accumulator.xtgPageBytes
+    );
+    const theoreticalOutputSize = containerOverheadBytes + theoreticalPageBytes;
+    const encodedOutputSizeWithoutDedupe = containerOverheadBytes + accumulator.totalEncodedPageBytes;
+
+    return {
+        pageCount: accumulator.pageCount,
+        storedPageFormats: accumulator.storedPageFormats,
+        strictMonochromePages: accumulator.strictMonochromePages,
+        adaptiveMonochromePages: accumulator.adaptiveMonochromePages,
+        grayscalePages: accumulator.grayscalePages,
+        strictMonochromeSavedBytes: accumulator.strictMonochromeSavedBytes,
+        adaptiveMonochromeSavedBytes: accumulator.adaptiveMonochromeSavedBytes,
+        monochromeSavedBytes: accumulator.strictMonochromeSavedBytes + accumulator.adaptiveMonochromeSavedBytes,
+        totalEncodedPageBytes: accumulator.totalEncodedPageBytes,
+        containerOverheadBytes,
+        theoreticalOutputSize,
+        encodedOutputSizeWithoutDedupe,
+        totalSavingsBytes: Math.max(0, theoreticalOutputSize - outputSize),
+        outputSize,
+        uniqueStoredPages: writerStats.uniquePages,
+        deduplicatedPages: writerStats.reusedPages,
+        uniqueDataBytes: writerStats.uniqueBytes,
+        reusedDataBytes: writerStats.reusedBytes
+    };
+}
 
 /**
  * Destroy renderer and free WASM memory
@@ -204,6 +290,13 @@ async function convertEpub(epubPath, outputPath, settings, progressCallback) {
     let scheduledPages = 0;
     let waiter = null;
     let processingError = null;
+    const exportStats = createExportStatsAccumulator({
+        width,
+        height,
+        isHQ,
+        pageCount: totalPages,
+        chapterCount: toc.length
+    });
 
     function notifyWaiter() {
         if (waiter) {
@@ -234,9 +327,10 @@ async function convertEpub(epubPath, outputPath, settings, progressCallback) {
         }
 
         while (completedPages.has(nextPageToWrite)) {
-            const encoded = completedPages.get(nextPageToWrite);
+            const processedPage = completedPages.get(nextPageToWrite);
             completedPages.delete(nextPageToWrite);
-            writer.appendPage(encoded);
+            recordPageStats(exportStats, processedPage.pageStats);
+            writer.appendPage(processedPage.encoded);
 
             if (progressCallback) {
                 progressCallback(nextPageToWrite + 1, totalPages);
@@ -256,7 +350,7 @@ async function convertEpub(epubPath, outputPath, settings, progressCallback) {
 
             pool.processPage(i, imageData)
                 .then((result) => {
-                    completedPages.set(result.pageIndex, result.encoded);
+                    completedPages.set(result.pageIndex, result);
                     notifyWaiter();
                 })
                 .catch((err) => {
@@ -276,12 +370,16 @@ async function convertEpub(epubPath, outputPath, settings, progressCallback) {
         }
 
         writer.finish();
+        const writerStats = writer.getStats();
+        const outputSize = fs.statSync(outputPath).size;
+        const finalizedStats = finalizeExportStats(exportStats, writerStats, outputSize);
 
         return {
             outputPath,
             pageCount: totalPages,
             format: output.format,
-            workersUsed: workerCount
+            workersUsed: workerCount,
+            ...finalizedStats
         };
     } finally {
         await pool.close();
